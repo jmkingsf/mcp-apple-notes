@@ -17,8 +17,51 @@ import {
 } from "@lancedb/lancedb/embedding";
 import { type Float, Float32, Utf8 } from "apache-arrow";
 import { pipeline } from "@huggingface/transformers";
+import * as fs from "node:fs/promises";
 
 const { turndown } = new TurndownService();
+
+// State management for resumable indexing
+interface IndexState {
+  processedNotes: string[];
+  failedNotes: { title: string; error: string }[];
+  lastUpdated: number;
+  totalNotes: number;
+  chunkCount: number;
+}
+
+const getStateFilePath = () =>
+  path.join(os.homedir(), ".mcp-apple-notes", "index-state.json");
+
+const loadIndexState = async (): Promise<IndexState> => {
+  try {
+    const stateFile = getStateFilePath();
+    const data = await fs.readFile(stateFile, "utf-8");
+    return JSON.parse(data);
+  } catch {
+    return {
+      processedNotes: [],
+      failedNotes: [],
+      lastUpdated: 0,
+      totalNotes: 0,
+      chunkCount: 0,
+    };
+  }
+};
+
+const saveIndexState = async (state: IndexState) => {
+  const stateDir = path.dirname(getStateFilePath());
+  await fs.mkdir(stateDir, { recursive: true });
+  await fs.writeFile(getStateFilePath(), JSON.stringify(state, null, 2));
+};
+
+const clearIndexState = async () => {
+  try {
+    await fs.unlink(getStateFilePath());
+  } catch {
+    // File doesn't exist, that's fine
+  }
+};
 const db = await lancedb.connect(
   path.join(os.homedir(), ".mcp-apple-notes", "data")
 );
@@ -98,10 +141,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "index-notes",
         description:
-          "Index all my Apple Notes for Semantic Search. Please tell the user that the sync takes couple of seconds up to couple of minutes depending on how many notes you have.",
+          "Index all my Apple Notes for Semantic Search. Streams progress updates. The sync takes couple of seconds up to couple of minutes depending on how many notes you have. Supports resumable indexing - run again if interrupted.",
         inputSchema: {
           type: "object",
-          properties: {},
+          properties: {
+            clearCache: {
+              type: "boolean",
+              description:
+                "Clear the index cache and restart from beginning (optional)",
+            },
+          },
           required: [],
         },
       },
@@ -138,6 +187,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             content: { type: "string" },
           },
           required: ["title", "content"],
+        },
+      },
+      {
+        name: "index-status",
+        description: "Get the current status of the indexing process",
+        inputSchema: {
+          type: "object",
+          properties: {},
+          required: [],
         },
       },
     ],
@@ -185,48 +243,119 @@ const getNoteDetailsByTitle = async (title: string) => {
   };
 };
 
-export const indexNotes = async (notesTable: any) => {
+export const indexNotes = async (
+  notesTable: any,
+  onProgress?: (message: string) => void
+) => {
   const start = performance.now();
   let report = "";
+  const state = await loadIndexState();
   const allNotes = (await getNotes()) || [];
-  const notesDetails = await Promise.all(
-    allNotes.map((note) => {
-      try {
-        return getNoteDetailsByTitle(note);
-      } catch (error) {
-        report += `Error getting note details for ${note}: ${error.message}\n`;
-        return {} as any;
-      }
-    })
+
+  // Filter out already processed notes
+  const notesToProcess = allNotes.filter(
+    (note) => !state.processedNotes.includes(note)
   );
 
-  const chunks = notesDetails
-    .filter((n) => n.title)
-    .map((node) => {
-      try {
-        return {
-          ...node,
-          content: turndown(node.content || ""), // this sometimes fails
-        };
-      } catch (error) {
-        return node;
-      }
-    })
-    .map((note, index) => ({
-      id: index.toString(),
-      title: note.title,
-      content: note.content, // turndown(note.content || ""),
-      creation_date: note.creation_date,
-      modification_date: note.modification_date,
-    }));
+  if (notesToProcess.length === 0) {
+    onProgress?.("✓ All notes already indexed. No new notes to process.");
+    return {
+      chunks: state.chunkCount,
+      report: "All notes already indexed",
+      allNotes: allNotes.length,
+      processed: 0,
+      time: performance.now() - start,
+      resumed: true,
+    };
+  }
 
-  await notesTable.add(chunks);
+  onProgress?.(
+    `Starting index of ${notesToProcess.length} notes (${state.processedNotes.length} already processed)...`
+  );
+
+  const processedChunks: any[] = [];
+  const newFailedNotes: { title: string; error: string }[] = [];
+
+  // Process notes in batches to enable streaming
+  const batchSize = 5;
+  for (let i = 0; i < notesToProcess.length; i += batchSize) {
+    const batch = notesToProcess.slice(i, i + batchSize);
+    const batchStartIndex = i;
+
+    onProgress?.(
+      `Processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(notesToProcess.length / batchSize)} (notes ${i + 1}-${Math.min(i + batchSize, notesToProcess.length)} of ${notesToProcess.length})...`
+    );
+
+    const batchDetails = await Promise.all(
+      batch.map((note) => {
+        try {
+          return getNoteDetailsByTitle(note);
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          const errorMsg = `Error getting note details for ${note}: ${errorMessage}`;
+          report += errorMsg + "\n";
+          newFailedNotes.push({ title: note, error: errorMessage });
+          return null;
+        }
+      })
+    );
+
+    const batchChunks = batchDetails
+      .filter((n) => n !== null)
+      .map((node) => {
+        try {
+          return {
+            ...node,
+            content: turndown(node.content || ""),
+          };
+        } catch (error) {
+          return node;
+        }
+      })
+      .map((note, index) => ({
+        id: `${state.chunkCount + processedChunks.length + index}`,
+        title: note.title,
+        content: note.content,
+        creation_date: note.creation_date,
+        modification_date: note.modification_date,
+      }));
+
+    if (batchChunks.length > 0) {
+      await notesTable.add(batchChunks);
+      processedChunks.push(...batchChunks);
+    }
+
+    // Update state after each batch
+    state.processedNotes.push(...batch.filter((note) => !newFailedNotes.some((f) => f.title === note)));
+    state.chunkCount += batchChunks.length;
+    state.failedNotes = [...state.failedNotes, ...newFailedNotes];
+    state.lastUpdated = Date.now();
+    state.totalNotes = allNotes.length;
+    await saveIndexState(state);
+
+    onProgress?.(
+      `✓ Processed ${i + batchSize} of ${notesToProcess.length} notes (${processedChunks.length} chunks created)`
+    );
+  }
+
+  onProgress?.(
+    `\n✓ Indexing complete! Processed ${notesToProcess.length} notes, created ${processedChunks.length} chunks.`
+  );
+
+  if (state.failedNotes.length > 0) {
+    onProgress?.(
+      `\n⚠ ${state.failedNotes.length} notes failed to process. Run index again to retry them.`
+    );
+  }
 
   return {
-    chunks: chunks.length,
+    chunks: state.chunkCount,
     report,
     allNotes: allNotes.length,
+    processed: notesToProcess.length,
+    failed: newFailedNotes.length,
     time: performance.now() - start,
+    resumed: notesToProcess.length < allNotes.length,
   };
 };
 
@@ -293,13 +422,67 @@ server.setRequestHandler(CallToolRequestSchema, async (request, c) => {
 
         return createTextResponse(`${note}`);
       } catch (error) {
-        return createTextResponse(error.message);
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        return createTextResponse(errorMessage);
       }
     } else if (name === "index-notes") {
-      const { time, chunks, report, allNotes } = await indexNotes(notesTable);
-      return createTextResponse(
-        `Indexed ${chunks} notes chunks in ${time}ms. You can now search for them using the "search-notes" tool.`
-      );
+      const clearCache = (args as any)?.clearCache === true;
+      if (clearCache) {
+        await clearIndexState();
+      }
+
+      // Collect all progress updates
+      const progressUpdates: string[] = [];
+      const onProgress = (message: string) => {
+        progressUpdates.push(message);
+        // Also log to stderr for real-time visibility
+        console.error(`[INDEX] ${message}`);
+      };
+
+      const result = await indexNotes(notesTable, onProgress);
+
+      // Format final response with all progress
+      const failedCount = result.failed || 0;
+      const finalMessage = [
+        ...progressUpdates,
+        "",
+        "📊 Final Summary:",
+        `Total notes: ${result.allNotes}`,
+        `Notes processed this run: ${result.processed}`,
+        `Total chunks indexed: ${result.chunks}`,
+        `Time taken: ${(result.time / 1000).toFixed(2)}s`,
+        ...(failedCount > 0
+          ? [
+              `Failed notes: ${failedCount}`,
+              "Run index-notes again to retry failed notes.",
+            ]
+          : []),
+        "",
+        "✓ You can now search for notes using the 'search-notes' tool.",
+      ].join("\n");
+
+      return createTextResponse(finalMessage);
+    } else if (name === "index-status") {
+      const state = await loadIndexState();
+      const allNotes = await getNotes();
+
+      const statusMessage = [
+        "📈 Index Status:",
+        `Processed notes: ${state.processedNotes.length}`,
+        `Total notes: ${allNotes.length}`,
+        `Indexed chunks: ${state.chunkCount}`,
+        `Failed notes: ${state.failedNotes.length}`,
+        `Last updated: ${state.lastUpdated ? new Date(state.lastUpdated).toLocaleString() : "Never"}`,
+        "",
+        ...(state.failedNotes.length > 0
+          ? [
+              "Failed notes:",
+              ...state.failedNotes.map((f) => `  • ${f.title}: ${f.error}`),
+            ]
+          : []),
+      ].join("\n");
+
+      return createTextResponse(statusMessage);
     } else if (name === "search-notes") {
       const { query } = QueryNotesSchema.parse(args);
       const combinedResults = await searchAndCombineResults(notesTable, query);
